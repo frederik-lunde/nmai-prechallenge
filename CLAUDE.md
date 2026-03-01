@@ -15,7 +15,7 @@ Get token from dev.ainm.no/challenge → Play → copy WebSocket URL.
 
 ## Architecture
 
-Single file: `bot.py` (Python 3.14, websockets==16.0).
+Two files: `bot.py` (main bot) and `game_logger.py` (structured logging). Python 3.14, websockets==16.0.
 
 Key functions:
 - `play()` — WebSocket loop; receives `game_state`/`game_over`, sends `{"actions": [...]}`; resets `known_shelves` on round 0
@@ -65,6 +65,20 @@ Key functions:
 6. **Re-assignment every round** — cheap with Manhattan; naturally handles picked items and order transitions
 
 The strategy can be changed if better strategies are found/tested. This file must then be updated.
+
+## Logging
+
+Structured per-game logs in `logs/{YYYYMMDD_HHMMSS}_{difficulty}.json`. Zero I/O during rounds — all data accumulated in memory, single write at game end.
+
+**JSON sections:**
+- `game` — metadata: timestamp, difficulty (auto-detected from grid size), grid dims, num_bots, drop_off, total_orders
+- `rounds` — compact per-round array (300 entries): score, bot positions/inv/role/action, active/preview order status
+- `events` — sparse: `pickup`, `delivery`, `order_complete`, `bfs_fallback`
+- `summary` — final score, per-order timing, per-bot stats, action/role distribution, score timeline, preview pre-pick effectiveness
+
+**Key files:**
+- `game_logger.py` — `GameLogger` class + `detect_difficulty()`. Event detection via inventory diffs between rounds.
+- `bot.py` changes: `decide_bot_action()` returns `(action, events)`, `decide_actions()` returns `(actions, assignments, round_events)`, `play()` wires up logger.
 
 ## Challenge Docs
 

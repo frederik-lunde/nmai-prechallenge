@@ -5,12 +5,14 @@ from collections import deque
 
 import websockets
 
+from game_logger import GameLogger
 
 WS_URL = sys.argv[1] if len(sys.argv) > 1 else None
 
 # Shelf cells are impassable but not included in grid.walls.
 # We accumulate all ever-seen item positions so empty shelves stay blocked in BFS.
 known_shelves: set[tuple[int, int]] = set()
+game_logger: GameLogger | None = None
 
 
 def bfs_to_goal(start, goal, walls_set, width, height):
@@ -281,12 +283,14 @@ def schedule_dropoffs(assignments, bots, drop_off_pos, walls_set, w, h):
 
 def decide_bot_action(bot, assignment, drop_off_pos, walls_set, w, h,
                       bot_positions, decided_moves):
-    """Per-bot decision using centralized assignment and collision-aware BFS."""
+    """Per-bot decision using centralized assignment and collision-aware BFS.
+    Returns (action_dict, events) where events is a list of bfs_fallback dicts."""
     bid = bot["id"]
     pos = tuple(bot["position"])
     role = assignment["role"]
     target_items = assignment["target_items"]
     deliver_priority = assignment["deliver_priority"]
+    events = []
 
     # Build collision-aware walls.
     # Game resolves actions in bot ID order: already-processed bots (in decided_moves)
@@ -305,53 +309,63 @@ def decide_bot_action(bot, assignment, drop_off_pos, walls_set, w, h,
     # ── DELIVER ──────────────────────────────────────────────────────────────
     if role == "deliver":
         if pos == drop_off_pos:
-            return {"bot": bid, "action": "drop_off"}
+            return {"bot": bid, "action": "drop_off"}, events
         # Only priority-0 bot actively paths to drop-off
         if deliver_priority == 0:
             path = bfs_to_goal(pos, drop_off_pos, walls_with_bots, w, h)
             if path is None:
                 path = bfs_to_goal(pos, drop_off_pos, walls_set, w, h)
-            return {"bot": bid, "action": path[0] if path else "wait"}
+                events.append({"type": "bfs_fallback", "round": -1, "bot": bid,
+                               "context": "deliver", "pos": list(pos)})
+            return {"bot": bid, "action": path[0] if path else "wait"}, events
         else:
             # Lower priority: pick preview items if assigned, otherwise wait
             if target_items:
                 path, item = bfs_nearest_item(pos, target_items, walls_with_bots, w, h)
                 if path is None:
                     path, item = bfs_nearest_item(pos, target_items, walls_set, w, h)
+                    if item is not None:
+                        events.append({"type": "bfs_fallback", "round": -1, "bot": bid,
+                                       "context": "deliver_prepick", "pos": list(pos)})
                 if item is not None:
                     if not path:
-                        return {"bot": bid, "action": "pick_up", "item_id": item["id"]}
-                    return {"bot": bid, "action": path[0]}
+                        return {"bot": bid, "action": "pick_up", "item_id": item["id"]}, events
+                    return {"bot": bid, "action": path[0]}, events
             # Don't block drop-off while waiting for delivery turn
             if pos == drop_off_pos:
-                return _step_off(bid, pos, walls_with_bots, w, h)
-            return {"bot": bid, "action": "wait"}
+                return _step_off(bid, pos, walls_with_bots, w, h), events
+            return {"bot": bid, "action": "wait"}, events
 
     # ── PICK UP ──────────────────────────────────────────────────────────────
     if role == "pick" and target_items:
         path, item = bfs_nearest_item(pos, target_items, walls_with_bots, w, h)
         if path is None:
             path, item = bfs_nearest_item(pos, target_items, walls_set, w, h)
+            if item is not None:
+                events.append({"type": "bfs_fallback", "round": -1, "bot": bid,
+                               "context": "pick", "pos": list(pos)})
         if item is not None:
             if not path:
-                return {"bot": bid, "action": "pick_up", "item_id": item["id"]}
-            return {"bot": bid, "action": path[0]}
+                return {"bot": bid, "action": "pick_up", "item_id": item["id"]}, events
+            return {"bot": bid, "action": path[0]}, events
 
     # ── FALLBACK: deliver if carrying active items but pick targets unreachable ─
     if assignment.get("has_active_inv"):
         if pos == drop_off_pos:
-            return {"bot": bid, "action": "drop_off"}
+            return {"bot": bid, "action": "drop_off"}, events
         path = bfs_to_goal(pos, drop_off_pos, walls_with_bots, w, h)
         if path is None:
             path = bfs_to_goal(pos, drop_off_pos, walls_set, w, h)
+            events.append({"type": "bfs_fallback", "round": -1, "bot": bid,
+                           "context": "fallback_deliver", "pos": list(pos)})
         if path:
-            return {"bot": bid, "action": path[0]}
+            return {"bot": bid, "action": path[0]}, events
 
     # ── IDLE ─────────────────────────────────────────────────────────────────
     # Don't block the drop-off; step to an adjacent walkable cell
     if pos == drop_off_pos:
-        return _step_off(bid, pos, walls_with_bots, w, h)
-    return {"bot": bid, "action": "wait"}
+        return _step_off(bid, pos, walls_with_bots, w, h), events
+    return {"bot": bid, "action": "wait"}, events
 
 
 def _step_off(bid, pos, walls_with_bots, w, h):
@@ -380,7 +394,8 @@ def decide_actions(state):
     preview = next((o for o in orders if o["status"] == "preview"), None)
 
     if not active:
-        return [{"bot": bot["id"], "action": "wait"} for bot in state["bots"]]
+        wait_actions = [{"bot": bot["id"], "action": "wait"} for bot in state["bots"]]
+        return wait_actions, {}, []
 
     drop_off_pos = tuple(state["drop_off"])
     bots = state["bots"]
@@ -402,20 +417,22 @@ def decide_actions(state):
     # Decide actions in bot ID order, tracking decided moves for collision avoidance
     decided_moves = {}
     actions = []
+    round_events = []
     for bot in sorted(bots, key=lambda b: b["id"]):
-        action = decide_bot_action(
+        action, bot_events = decide_bot_action(
             bot, assignments[bot["id"]], drop_off_pos, walls_set, w, h,
             bot_positions, decided_moves,
         )
         actions.append(action)
+        round_events.extend(bot_events)
         # Track where this bot will be next round
         decided_moves[bot["id"]] = predict_position(bot, action["action"])
 
-    return actions
+    return actions, assignments, round_events
 
 
 async def play():
-    global known_shelves
+    global known_shelves, game_logger
     print(f"Connecting to {WS_URL}")
     async with websockets.connect(WS_URL) as ws:
         print("Connected!\n")
@@ -423,6 +440,8 @@ async def play():
             state = json.loads(raw)
 
             if state["type"] == "game_over":
+                if game_logger:
+                    game_logger.finalize(state)
                 print("\n=== GAME OVER ===")
                 print(f"Score:            {state['score']}")
                 print(f"Rounds used:      {state['rounds_used']}")
@@ -436,6 +455,8 @@ async def play():
                 # Reset shelves on first round to prevent stale data between games
                 if r == 0:
                     known_shelves = set()
+                    game_logger = GameLogger()
+                    game_logger.init_game(state)
 
                 if r % 10 == 0 or r < 3:
                     orders = state["orders"]
@@ -456,7 +477,15 @@ async def play():
                         bot_summary += f" +{n_bots - 4} more"
                     print(f"Round {r:3d} | score {state['score']:3d} | {bot_summary}{info}")
 
-                actions = decide_actions(state)
+                actions, assignments, round_events = decide_actions(state)
+
+                # Patch round number into bfs_fallback events (set to -1 in decide_bot_action)
+                for ev in round_events:
+                    if ev.get("round") == -1:
+                        ev["round"] = r
+
+                if game_logger:
+                    game_logger.log_round(state, assignments, actions, round_events)
 
                 await ws.send(json.dumps({"actions": actions}))
 

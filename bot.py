@@ -245,6 +245,8 @@ def assign_items_to_bots(bots, active_needed, preview_needed, items, walls_set, 
             t = item["type"]
             if iid in reserved_item_ids:
                 continue
+            if assignments[bid]["role"] == "deliver":
+                continue  # Deliver bots head straight to drop-off
             if t not in preview_remaining or preview_remaining[t] <= 0:
                 continue
             spare = bot_info[bid]["inv_space"] - bot_assigned_count[bid]
@@ -282,7 +284,7 @@ def schedule_dropoffs(assignments, bots, drop_off_pos, walls_set, w, h):
 
 
 def decide_bot_action(bot, assignment, drop_off_pos, walls_set, w, h,
-                      bot_positions, decided_moves):
+                      bot_positions, decided_moves, items=()):
     """Per-bot decision using centralized assignment and collision-aware BFS.
     Returns (action_dict, events) where events is a list of bfs_fallback dicts."""
     bid = bot["id"]
@@ -310,31 +312,15 @@ def decide_bot_action(bot, assignment, drop_off_pos, walls_set, w, h,
     if role == "deliver":
         if pos == drop_off_pos:
             return {"bot": bid, "action": "drop_off"}, events
-        # Only priority-0 bot actively paths to drop-off
-        if deliver_priority == 0:
-            path = bfs_to_goal(pos, drop_off_pos, walls_with_bots, w, h)
-            if path is None:
-                path = bfs_to_goal(pos, drop_off_pos, walls_set, w, h)
-                events.append({"type": "bfs_fallback", "round": -1, "bot": bid,
-                               "context": "deliver", "pos": list(pos)})
-            return {"bot": bid, "action": path[0] if path else "wait"}, events
-        else:
-            # Lower priority: pick preview items if assigned, otherwise wait
-            if target_items:
-                path, item = bfs_nearest_item(pos, target_items, walls_with_bots, w, h)
-                if path is None:
-                    path, item = bfs_nearest_item(pos, target_items, walls_set, w, h)
-                    if item is not None:
-                        events.append({"type": "bfs_fallback", "round": -1, "bot": bid,
-                                       "context": "deliver_prepick", "pos": list(pos)})
-                if item is not None:
-                    if not path:
-                        return {"bot": bid, "action": "pick_up", "item_id": item["id"]}, events
-                    return {"bot": bid, "action": path[0]}, events
-            # Don't block drop-off while waiting for delivery turn
-            if pos == drop_off_pos:
-                return _step_off(bid, pos, walls_with_bots, w, h), events
-            return {"bot": bid, "action": "wait"}, events
+        # All delivery bots path to drop-off; collision-aware BFS queues naturally
+        path = bfs_to_goal(pos, drop_off_pos, walls_with_bots, w, h)
+        if path is None:
+            path = bfs_to_goal(pos, drop_off_pos, walls_set, w, h)
+            events.append({"type": "bfs_fallback", "round": -1, "bot": bid,
+                           "context": "deliver", "pos": list(pos)})
+        if path:
+            return {"bot": bid, "action": path[0]}, events
+        return {"bot": bid, "action": "wait"}, events
 
     # ── PICK UP ──────────────────────────────────────────────────────────────
     if role == "pick" and target_items:
@@ -365,6 +351,11 @@ def decide_bot_action(bot, assignment, drop_off_pos, walls_set, w, h,
     # Don't block the drop-off; step to an adjacent walkable cell
     if pos == drop_off_pos:
         return _step_off(bid, pos, walls_with_bots, w, h), events
+    # Pre-position toward nearest shelf item instead of standing still
+    if items:
+        path, _ = bfs_nearest_item(pos, items, walls_with_bots, w, h)
+        if path:
+            return {"bot": bid, "action": path[0]}, events
     return {"bot": bid, "action": "wait"}, events
 
 
@@ -421,12 +412,22 @@ def decide_actions(state):
     for bot in sorted(bots, key=lambda b: b["id"]):
         action, bot_events = decide_bot_action(
             bot, assignments[bot["id"]], drop_off_pos, walls_set, w, h,
-            bot_positions, decided_moves,
+            bot_positions, decided_moves, items,
         )
         actions.append(action)
         round_events.extend(bot_events)
-        # Track where this bot will be next round
-        decided_moves[bot["id"]] = predict_position(bot, action["action"])
+
+        # Predict position, accounting for server-side collisions
+        predicted = predict_position(bot, action["action"])
+        for other_bid, other_pos in bot_positions.items():
+            if other_bid != bot["id"] and other_bid not in decided_moves and other_pos == predicted:
+                # Move will fail on server (undecided bot is still there)
+                action["action"] = "wait"
+                action.pop("item_id", None)
+                actions[-1] = action
+                predicted = tuple(bot["position"])
+                break
+        decided_moves[bot["id"]] = predicted
 
     return actions, assignments, round_events
 

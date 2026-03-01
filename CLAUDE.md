@@ -59,7 +59,7 @@ Key functions:
 ### Multi-bot coordination (Medium/Hard/Expert)
 1. **Centralized item assignment** — `assign_items_to_bots()` uses Manhattan distance to greedily assign items to nearest bots, preventing duplicate targeting
 2. **Global inventory tracking** — all bots' carried items are subtracted from order needs before assigning shelf picks
-3. **Drop-off sequencing** — `schedule_dropoffs()` assigns priority by BFS distance; only priority-0 bot paths to drop-off, others wait or pre-pick
+3. **Pipeline delivery** — all deliver bots path to drop-off simultaneously; collision-aware BFS queues them naturally instead of serial wait
 4. **Collision avoidance** — other bots treated as temporary BFS walls; higher-ID bots also avoid lower-ID bots' decided next positions
 5. **BFS fallback** — if collision-aware BFS fails (trapped), retry with original walls to avoid permanent deadlock
 6. **Re-assignment every round** — cheap with Manhattan; naturally handles picked items and order transitions
@@ -83,3 +83,6 @@ Structured per-game logs in `logs/{YYYYMMDD_HHMMSS}_{difficulty}.json`. Zero I/O
 ## Challenge Docs
 
 MCP server `grocery-bot` provides full docs — use `list_docs` and `search_docs` tools.
+
+
+When iterating on the bot, run game_logger.py on the latest run of the bot and iterate using the data from the logs as well as other ideas.
